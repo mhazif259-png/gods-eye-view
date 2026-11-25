@@ -44,8 +44,16 @@ import {
 import { filterTrailing24h, parseFirmsCsv } from './src/data/firmsCsv.js';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { defineConfig, loadEnv } from 'vite';
-import cesium from 'vite-plugin-cesium';
+// The Vercel API function loads this same config with tiny shims so the
+// serverless bundle does not need Vite/Rollup's native binary. Normal dev/build
+// runs keep using the real modules.
+const apiShim = process.env.GEV_VERCEL_API === '1';
+const { defineConfig, loadEnv } = apiShim
+  ? await import('./api/vite-shim.mjs')
+  : await import('vite');
+const { default: cesium } = apiShim
+  ? await import('./api/cesium-shim.mjs')
+  : await import('vite-plugin-cesium');
 import { normalizeRadioCountryInput } from './src/data/radioCountry.js';
 import {
   normalizeRegionalArticles,

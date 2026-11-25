@@ -3,9 +3,10 @@
  *
  * The application's API surface lives in vite.config.js as dev-server
  * middleware. Rather than duplicating ~7,700 lines of proxy logic, this
- * function boots the same config in Vite's middleware mode and forwards
- * /api/* requests to it. Serverless functions cannot write the repo checkout,
- * so caches are redirected to the OS temp directory.
+ * function loads the same config with lightweight shims, asks every Vite plugin
+ * to register its middlewares, and dispatches /api/* requests through them.
+ * No Vite/Rollup runtime is needed, so there is no platform-native binary to
+ * go missing in the serverless bundle.
  *
  * The in-app POWER UP panel also has a browser-supplied-key (BYOK) mode here:
  * keys travel in the `x-gev-byok` header on the visitor's own requests and are
@@ -13,60 +14,62 @@
  * written to disk and no key is shared between visitors.
  */
 
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { createServer } from 'vite';
+import './setup-api-shim.mjs';
+import configFactory from '../vite.config.js';
 import {
   keySetupStatus,
   knownKeySetupEnvVars,
   validateKeySetupUpdates,
 } from '../src/keySetupCore.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ALLOWED_ENV_VARS = knownKeySetupEnvVars();
+const CONTEXT = { command: 'serve', mode: 'production', isPreview: false };
 
-/** Find the checkout that contains vite.config.js. */
-function resolveProjectRoot() {
-  const candidates = [
-    path.resolve(HERE, '..'),
-    process.cwd(),
-    path.resolve(process.cwd(), 'gods-eye-view-main'),
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(path.join(candidate, 'vite.config.js'))) return candidate;
+/** @type {Promise<Array<[string, Function]>>|null} */
+let routesPromise = null;
+
+async function buildRoutes() {
+  const config = typeof configFactory === 'function' ? configFactory(CONTEXT) : configFactory;
+  const routes = [];
+  const server = {
+    config,
+    httpServer: null,
+    middlewares: {
+      use(prefix, handler) {
+        routes.push([prefix, handler]);
+      },
+    },
+  };
+
+  for (const plugin of config?.plugins || []) {
+    if (!plugin || typeof plugin !== 'object') continue;
+    // The setup panel writes files and restarts Vite; the hosted router
+    // handles those two endpoints itself below.
+    if (plugin.name === 'gev-key-setup') continue;
+    const applies = plugin.apply === undefined
+      || plugin.apply === 'serve'
+      || (typeof plugin.apply === 'function' && plugin.apply(config, CONTEXT));
+    if (!applies || typeof plugin.configureServer !== 'function') continue;
+    try {
+      await plugin.configureServer(server, CONTEXT);
+    } catch (error) {
+      // One broken plugin must not take down every other API route.
+      console.error(`[API] ${plugin.name || 'plugin'} failed to register:`, error?.message || error);
+    }
   }
-  return path.resolve(HERE, '..');
+  return routes;
 }
 
-const ROOT = resolveProjectRoot();
-const CONFIG_FILE = path.join(ROOT, 'vite.config.js');
-const ALLOWED_ENV_VARS = knownKeySetupEnvVars();
-
-/** @type {Promise<import('vite').ViteDevServer>|null} */
-let vitePromise = null;
-
-async function getVite() {
-  if (!vitePromise) {
-    const tmp = os.tmpdir();
-    // Keep cwd at the checkout: the CCTV config loader reads local JSON files
-    // relative to it. Disk-cache writes fail closed on Vercel's read-only fs,
-    // and every cache writer in vite.config.js catches that failure.
-    // AISStream needs a long-lived WebSocket, so never try to open one here.
+function getRoutes() {
+  if (!routesPromise) {
+    // AISStream needs a long-lived WebSocket; never open one here.
     delete process.env.AISSTREAM_API_KEY;
-    vitePromise = createServer({
-      root: ROOT,
-      configFile: CONFIG_FILE,
-      cacheDir: path.join(tmp, 'gev-vite-cache'),
-      appType: 'custom',
-      logLevel: 'silent',
-      server: { middlewareMode: true },
-    }).catch((error) => {
-      vitePromise = null;
+    routesPromise = buildRoutes().catch((error) => {
+      routesPromise = null;
       throw error;
     });
   }
-  return vitePromise;
+  return routesPromise;
 }
 
 /**
@@ -169,6 +172,51 @@ async function handleSetup(req, res, values) {
   return true;
 }
 
+/** Connect-style dispatch over the middlewares collected from Vite plugins. */
+function dispatch(req, res, routes) {
+  let index = 0;
+  const notFound = () => {
+    if (res.headersSent) return res.end();
+    res.statusCode = 404;
+    res.setHeader('content-type', 'text/plain; charset=utf-8');
+    res.end('Not found');
+  };
+  const next = (error) => {
+    if (error) {
+      console.error('[API] middleware error:', error?.message || error);
+      if (!res.headersSent) sendJson(res, 500, { error: 'API proxy failed' });
+      return res.end();
+    }
+    while (index < routes.length) {
+      const [prefix, handler] = routes[index++];
+      const current = req.url || '/';
+      const pathname = current.split('?')[0];
+      if (pathname !== prefix && !pathname.startsWith(`${prefix}/`)) continue;
+
+      const original = req.url;
+      req.originalUrl ||= original;
+      const suffix = current.slice(prefix.length);
+      req.url = suffix.startsWith('/') ? suffix : `/${suffix}`;
+      let called = false;
+      const localNext = (err) => {
+        if (called) return;
+        called = true;
+        req.url = original;
+        next(err);
+      };
+      try {
+        const result = handler(req, res, localNext);
+        if (result && typeof result.then === 'function') result.then(() => {}, localNext);
+      } catch (err) {
+        localNext(err);
+      }
+      return;
+    }
+    notFound();
+  };
+  next();
+}
+
 export default async function handler(req, res) {
   const byok = readByok(req);
   applyByok(req, res, byok);
@@ -198,23 +246,6 @@ export default async function handler(req, res) {
 
   if (await handleSetup(req, res, byok)) return;
 
-  const vite = await getVite();
-  await new Promise((resolve) => {
-    let settled = false;
-    const done = () => {
-      if (settled) return;
-      settled = true;
-      resolve();
-    };
-    res.once('finish', done);
-    res.once('close', done);
-    vite.middlewares(req, res, () => {
-      if (!res.headersSent) {
-        res.statusCode = 404;
-        res.setHeader('content-type', 'text/plain; charset=utf-8');
-      }
-      res.end('Not found');
-      done();
-    });
-  });
+  const routes = await getRoutes();
+  dispatch(req, res, routes);
 }
