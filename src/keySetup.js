@@ -14,6 +14,8 @@
  * the chip and the dialog are removed outright.
  */
 
+import { mergeByokStatus, saveByokKeys } from './byok.js';
+
 /** Chip label — pure, exported for tests. */
 export function keySetupChipLabel(status) {
   const missing = Math.max(0, (status?.total || 0) - (status?.setCount || 0));
@@ -162,6 +164,11 @@ export async function initKeySetup({ documentRef = globalThis.document, fetchImp
     return null;
   }
 
+  // Hosted deployments cannot write a server-side .env. The API reports
+  // `store: 'browser'` and keys are kept in this browser instead.
+  const browserStore = status?.store === 'browser';
+  if (browserStore) status = mergeByokStatus(status);
+
   const rowsHost = root.querySelector('[data-key-setup-rows]');
   const applyButton = root.querySelector('[data-key-setup-apply]');
   const closeButton = root.querySelector('[data-key-setup-close]');
@@ -251,9 +258,11 @@ export async function initKeySetup({ documentRef = globalThis.document, fetchImp
 
   const say = (text) => { if (statusLine) statusLine.textContent = text; };
 
-  const storeLabel = () => (status?.store === 'pinokio-environment'
-    ? 'your app configuration'
-    : 'your local .env');
+  const storeLabel = () => (browserStore
+    ? 'this browser'
+    : status?.store === 'pinokio-environment'
+      ? 'your app configuration'
+      : 'your local .env');
 
   const submitUpdates = async (updates, doneVerb) => {
     if (busy) return;
@@ -262,6 +271,27 @@ export async function initKeySetup({ documentRef = globalThis.document, fetchImp
     applyButton?.setAttribute('aria-disabled', 'true');
     say('Saving…');
     try {
+      if (browserStore) {
+        const values = saveByokKeys(updates);
+        for (const input of root.querySelectorAll('input[data-env-var]')) input.value = '';
+        const nextStatus = mergeByokStatus({
+          ...status,
+          ...{ store: 'browser' },
+        });
+        render(nextStatus);
+        if (googleWasUnset && values.GOOGLE_MAPS_API_KEY) {
+          try {
+            const hash = globalThis.location?.hash?.slice(1) || '';
+            const next = stripKeylessBasemapFromHash(hash);
+            if (next !== null) globalThis.history?.replaceState?.(null, '', `#${next}`);
+          } catch {
+            // Continuity is a nicety, never a blocker.
+          }
+        }
+        say(`${doneVerb} this browser. Reloading to apply…`);
+        globalThis.setTimeout?.(() => globalThis.location?.reload?.(), 600);
+        return;
+      }
       const response = await doFetch('/api/setup/keys', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
