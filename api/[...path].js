@@ -14,7 +14,7 @@
  * written to disk and no key is shared between visitors.
  */
 
-import './setup-api-shim.mjs';
+import '../server/setup-api-shim.mjs';
 import configFactory from '../vite.config.js';
 import {
   keySetupStatus,

@@ -49,10 +49,10 @@ import { createRequire } from 'node:module';
 // runs keep using the real modules.
 const apiShim = process.env.GEV_VERCEL_API === '1';
 const { defineConfig, loadEnv } = apiShim
-  ? await import('./api/vite-shim.mjs')
+  ? await import('./server/vite-shim.mjs')
   : await import('vite');
 const { default: cesium } = apiShim
-  ? await import('./api/cesium-shim.mjs')
+  ? await import('./server/cesium-shim.mjs')
   : await import('vite-plugin-cesium');
 import { normalizeRadioCountryInput } from './src/data/radioCountry.js';
 import {
